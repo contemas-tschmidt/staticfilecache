@@ -30,14 +30,27 @@ final class GenerateMiddlewareTest extends AbstractMiddlewareTest
 
     protected CookieService&MockObject $cookieService;
 
+    protected string $cacheDirectory = '';
+
     protected function setUp(): void
     {
         parent::setUp();
+        $this->cacheDirectory = sys_get_temp_dir() . '/sfc-generate-middleware-' . bin2hex(random_bytes(6));
+        mkdir($this->cacheDirectory);
         $this->cache = $this->createMock(FrontendInterface::class);
         $this->cacheService = $this->createMock(CacheService::class);
         $this->cacheService->method('get')->willReturn($this->cache);
         $this->cookieService = $this->createMock(CookieService::class);
         $this->setExtensionConfiguration();
+    }
+
+    protected function tearDown(): void
+    {
+        foreach (glob($this->cacheDirectory . '/*') ?: [] as $file) {
+            unlink($file);
+        }
+        rmdir($this->cacheDirectory);
+        parent::tearDown();
     }
 
     public function testNotCachableResponseIsNotCached(): void
@@ -119,10 +132,58 @@ final class GenerateMiddlewareTest extends AbstractMiddlewareTest
         $this->cache->method('get')->willReturn(['explanation' => [], 'expires' => PHP_INT_MAX]);
         $this->cache->expects(self::never())->method('set');
         $this->cookieService->method('hasCookie')->willReturn(false);
+        touch($this->cacheDirectory . '/index');
 
         $response = $this->getMiddleware()->process($this->getRequest(), $this->getHandler($this->getCachableResponse()));
 
         self::assertSame('TYPO3 - already in cache', $response->getHeaderLine('X-SFC-State'));
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function generatedFileProvider(): array
+    {
+        return [
+            'plain' => ['index'],
+            'gzip' => ['index.gz'],
+            'brotli' => ['index.br'],
+            'php' => ['index.php'],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('generatedFileProvider')]
+    public function testValidCacheEntryWithAnyGeneratedFileIsNotStoredAgain(string $file): void
+    {
+        $this->cache->method('get')->willReturn(['explanation' => [], 'expires' => PHP_INT_MAX]);
+        $this->cache->expects(self::never())->method('set');
+        $this->cookieService->method('hasCookie')->willReturn(false);
+        touch($this->cacheDirectory . '/' . $file);
+
+        $this->getMiddleware()->process($this->getRequest(), $this->getHandler($this->getCachableResponse()));
+    }
+
+    public function testValidCacheEntryWithoutFileIsStoredAgain(): void
+    {
+        $this->setExtensionConfiguration(['debugHeaders' => '1']);
+        $this->cache->method('get')->willReturn(['explanation' => [], 'expires' => PHP_INT_MAX]);
+        $this->cache->expects(self::once())->method('set');
+        $this->cookieService->method('hasCookie')->willReturn(false);
+
+        $response = $this->getMiddleware()->process($this->getRequest(), $this->getHandler($this->getCachableResponse()));
+
+        self::assertSame('TYPO3 - add to cache', $response->getHeaderLine('X-SFC-State'));
+    }
+
+    public function testValidCacheEntryWithUnresolvableFileNameIsStoredAgain(): void
+    {
+        $this->cache->method('get')->willReturn(['explanation' => [], 'expires' => PHP_INT_MAX]);
+        $this->cache->expects(self::once())->method('set');
+        $this->cookieService->method('hasCookie')->willReturn(false);
+
+        $middleware = $this->getMiddleware();
+        $middleware->failToResolveFileName = true;
+        $middleware->process($this->getRequest(), $this->getHandler($this->getCachableResponse()));
     }
 
     /**
@@ -146,6 +207,8 @@ final class GenerateMiddlewareTest extends AbstractMiddlewareTest
         $this->cache->method('get')->willReturn($entry);
         $this->cache->expects(self::once())->method('set');
         $this->cookieService->method('hasCookie')->willReturn($hasCookie);
+        // The file exists: only the entry (or the cookie) decides here.
+        touch($this->cacheDirectory . '/index');
 
         $this->getMiddleware()->process($this->getRequest(), $this->getHandler($this->getCachableResponse()));
     }
@@ -186,14 +249,38 @@ final class GenerateMiddlewareTest extends AbstractMiddlewareTest
         return (new ServerRequest('https://example.com/page/'))->withAttribute('frontend.cache.collector', $collector);
     }
 
-    protected function getMiddleware(): GenerateMiddleware
+    protected function getMiddleware(): GenerateMiddlewareWithFixedFileName
     {
-        return new GenerateMiddleware(
+        $middleware = new GenerateMiddlewareWithFixedFileName(
             $this->getEventDispatcher(),
             $this->cookieService,
             new Typo3Version(),
             $this->cacheService,
             $this->setExtensionConfiguration($GLOBALS['TYPO3_CONF_VARS']['EXTENSIONS']['staticfilecache'] ?? []),
         );
+        $middleware->fileName = $this->cacheDirectory . '/index';
+
+        return $middleware;
+    }
+}
+
+/**
+ * Middleware that does not resolve the cache file via the identifier builder, so the tests do not need a TYPO3 environment.
+ *
+ * @internal
+ */
+final class GenerateMiddlewareWithFixedFileName extends GenerateMiddleware
+{
+    public string $fileName = '';
+
+    public bool $failToResolveFileName = false;
+
+    protected function getStaticFileName(string $uri): string
+    {
+        if ($this->failToResolveFileName) {
+            throw new \Exception('Invalid RequestUri as cache identifier: ' . $uri, 2346782);
+        }
+
+        return $this->fileName;
     }
 }

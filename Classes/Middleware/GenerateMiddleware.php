@@ -12,6 +12,7 @@ use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use Psr\Http\Server\RequestHandlerInterface;
+use SFC\Staticfilecache\Cache\IdentifierBuilder;
 use SFC\Staticfilecache\Event\PreGenerateEvent;
 use SFC\Staticfilecache\Service\CacheService;
 use SFC\Staticfilecache\Service\ConfigurationService;
@@ -19,6 +20,7 @@ use SFC\Staticfilecache\Service\CookieService;
 use SFC\Staticfilecache\Service\DateTimeService;
 use TYPO3\CMS\Core\Http\ServerRequest;
 use TYPO3\CMS\Core\Information\Typo3Version;
+use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Extbase\Utility\DebuggerUtility;
 
 class GenerateMiddleware implements MiddlewareInterface
@@ -98,6 +100,12 @@ class GenerateMiddleware implements MiddlewareInterface
     /**
      * Determines whether the given $uri has a valid cache entry.
      *
+     * The entry (database) is only valid together with the generated file. An
+     * entry without a file (e.g. the cache directory was emptied while the
+     * database table was not) would otherwise be reported as "already in cache"
+     * until it expires, and every request would be handled by PHP in the
+     * meantime, because nobody writes the file again.
+     *
      * @param string $uri
      *
      * @return bool is available and valid
@@ -108,7 +116,41 @@ class GenerateMiddleware implements MiddlewareInterface
 
         return false !== $entry
             && empty($entry['explanation'])
-            && $entry['expires'] >= (new DateTimeService())->getCurrentTime();
+            && $entry['expires'] >= (new DateTimeService())->getCurrentTime()
+            && $this->hasStaticFile((string) $uri);
+    }
+
+    /**
+     * Determines whether at least one generated file exists for the given $uri.
+     *
+     * Which file is written depends on the enabled generators (plain, gzip,
+     * brotli, php), so every variant counts.
+     */
+    protected function hasStaticFile(string $uri): bool
+    {
+        try {
+            $fileName = $this->getStaticFileName($uri);
+        } catch (\Throwable) {
+            return false;
+        }
+
+        foreach (['', '.gz', '.br', '.php'] as $suffix) {
+            if (is_file($fileName . $suffix)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Absolute path of the (plain) cache file for the given $uri.
+     *
+     * @throws \Exception
+     */
+    protected function getStaticFileName(string $uri): string
+    {
+        return GeneralUtility::makeInstance(IdentifierBuilder::class)->getFilepath($uri);
     }
 
     /**
